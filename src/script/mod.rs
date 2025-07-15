@@ -18,21 +18,13 @@ use onion_vm::{
         object::{OnionObject, OnionStaticObject},
         tuple::OnionTuple,
     },
-    unwrap_object, GC,
+    GC,
 };
 
-mod stdlib;
-pub use arc_gc;
+pub mod stdlib;
 pub use onion_frontend;
 pub use onion_vm;
-pub use stdlib::build_named_dict;
-pub use stdlib::get_attr_direct;
-pub use stdlib::wrap_native_function;
 
-// Import necessary items for async
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use tokio::time::{sleep, Duration};
 
 pub async fn eval(
@@ -133,6 +125,11 @@ pub async fn execute_bytecode_package(
                 return Err("Invalid operation: SpawnRunnable is not supported".to_string());
             }
             StepResult::Error(ref error) => {
+                if let RuntimeError::Pending = error {
+                    // If the error is pending, we can continue
+                    sleep(Duration::from_secs(0)).await;
+                    continue;
+                }
                 return Err(format!("Execution error: {}", error));
             }
             StepResult::NewRunnable(_) => {
@@ -144,18 +141,7 @@ pub async fn execute_bytecode_package(
                 sleep(Duration::from_secs(0)).await;
             }
             StepResult::Return(ref result) => {
-                let result_borrowed = result.weak();
-                let result = unwrap_object!(result_borrowed, OnionObject::Pair)
-                    .map_err(|e| format!("Failed to unwrap result: {:?}", e))?;
-                let success = *unwrap_object!(result.get_key(), OnionObject::Boolean)
-                    .map_err(|e| format!("Failed to get success key: {:?}", e))?;
-                if !success {
-                    return Err(result
-                        .get_value()
-                        .to_string(&vec![])
-                        .map_err(|e| format!("Failed to get error message: {:?}", e))?);
-                }
-                return Ok(result.get_value().clone().stabilize());
+                return Ok(result.as_ref().clone());
             }
         }
     }

@@ -230,13 +230,14 @@ const DUMMY_WAKER_VTABLE: RawWakerVTable =
 const DUMMY_RAW_WAKER: RawWaker = RawWaker::new(std::ptr::null(), &DUMMY_WAKER_VTABLE);
 
 // 一个辅助函数，用于安全地创建一个 Waker。
-fn dummy_waker() -> Waker {
+pub fn dummy_waker() -> Waker {
     // unsafe: DUMMY_RAW_WAKER 是一个有效的、虽然是无操作的 RawWaker。
     // 它的生命周期是 'static，所以这里是安全的。
     unsafe { Waker::from_raw(DUMMY_RAW_WAKER) }
 }
 
 // The wrap_async_native_function
+#[allow(dead_code)]
 pub fn wrap_async_native_function<F, Fut>(
     params: &OnionStaticObject,
     capture: Option<&OnionStaticObject>,
@@ -336,6 +337,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 pub fn wrap_native_method_function<F>(
     params: &OnionStaticObject,
     capture: Option<&OnionStaticObject>,

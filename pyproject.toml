@@ -12,4 +12,6 @@ classifiers = [
 ]
 dynamic = ["version"]
 [tool.maturin]
+module-name = "onion"
+python-source = "src_py"
 features = ["pyo3/extension-module"]

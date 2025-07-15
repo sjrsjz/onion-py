@@ -1,7 +1,9 @@
+use arc_gc::arc::GCArcWeak;
+use arc_gc::traceable::GCTraceable;
 use onion_frontend::dir_stack::DirectoryStack;
 use onion_vm::lambda::runnable::RuntimeError;
 use onion_vm::types::named::OnionNamed;
-use onion_vm::types::object::{OnionObject, OnionStaticObject};
+use onion_vm::types::object::{OnionObject, OnionObjectCell, OnionObjectExt, OnionStaticObject};
 use onion_vm::types::pair::OnionPair;
 // 引入 RuntimeError
 use onion_vm::types::tuple::OnionTuple;
@@ -9,13 +11,32 @@ use pyo3::exceptions::PyTypeError; // 引入 PyTypeError
 use pyo3::types::PyAny;
 use pyo3::{prelude::*, IntoPyObjectExt};
 use pyo3_async_runtimes::tokio::future_into_py;
+use std::fmt::Debug;
 use std::sync::Arc;
 
+mod pycallable;
 mod script;
 
 // Helper function to convert RuntimeError to PyErr
 fn runtime_error_to_pyerr(err: RuntimeError) -> PyErr {
     PyTypeError::new_err(err.to_string()) // 将 Runtime Error 转换为 Python 的 TypeError
+}
+
+fn pyerr_to_runtime_error(e: PyErr, py: Python<'_>) -> RuntimeError {
+    return RuntimeError::CustomValue(
+        OnionObject::Custom(Arc::new(OnionPyObject {
+            inner: match e.into_py_any(py) {
+                Ok(obj) => obj,
+                Err(e) => {
+                    return RuntimeError::DetailedError(
+                        format!("Failed to call Python coroutine: {}", e).into(),
+                    );
+                }
+            },
+        }))
+        .stabilize()
+        .into(),
+    );
 }
 
 // 定义 Python 包装类
@@ -107,6 +128,13 @@ impl PyOnionObject {
         self.inner
             .weak()
             .with_data(|obj| Ok(matches!(obj, OnionObject::Named(_))))
+            .map_err(runtime_error_to_pyerr)
+    }
+
+    fn is_custom(&self) -> PyResult<bool> {
+        self.inner
+            .weak()
+            .with_data(|obj| Ok(matches!(obj, OnionObject::Custom(_))))
             .map_err(runtime_error_to_pyerr)
     }
 
@@ -472,6 +500,25 @@ impl PyOnionObject {
             .map_err(runtime_error_to_pyerr)
     }
 
+    fn unwrap_py(&self, py: Python) -> PyResult<PyObject> {
+        // 将 OnionObject::Custom 转换为 PyOnionObject
+        match self.inner.weak() {
+            OnionObject::Custom(custom) => {
+                match custom.as_any().downcast_ref::<OnionPyObject>() {
+                    // 如果是 PyOnionObject，返回其 PyObject
+                    Some(py_onion) => Ok(py_onion.inner.clone_ref(py)),
+                    None => {
+                        // 否则返回错误
+                        Err(PyTypeError::new_err(
+                            "Cannot unwrap non-PyOnionObject custom OnionObject",
+                        ))
+                    }
+                }
+            }
+            _ => Err(PyTypeError::new_err("Cannot unwrap non-custom OnionObject")),
+        }
+    }
+
     #[staticmethod]
     fn pair(k: PyObject, v: PyObject, py: Python) -> PyResult<Self> {
         let k = py_object_to_onion_object(py, k)?;
@@ -497,6 +544,62 @@ impl PyOnionObject {
     // 内部使用的工厂方法，从 Rust 的 OnionStaticObject 创建 PyOnionObject
     fn from_rust(obj: OnionStaticObject) -> Self {
         PyOnionObject { inner: obj }
+    }
+}
+
+pub struct OnionPyObject {
+    inner: PyObject,
+}
+
+impl Debug for OnionPyObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OnionPyObject({:?})", self.inner)
+    }
+}
+
+impl GCTraceable<OnionObjectCell> for OnionPyObject {
+    fn collect(&self, _: &mut std::collections::VecDeque<GCArcWeak<OnionObjectCell>>) {}
+}
+
+impl OnionObjectExt for OnionPyObject {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn upgrade(&self, _: &mut Vec<arc_gc::arc::GCArc<OnionObjectCell>>) {
+        // nothing
+    }
+
+    fn equals(&self, _: &OnionObject) -> Result<bool, RuntimeError> {
+        Ok(false)
+    }
+
+    fn is_same(&self, _: &OnionObject) -> Result<bool, RuntimeError> {
+        Ok(false)
+    }
+
+    fn type_of(&self) -> Result<String, RuntimeError> {
+        Ok("PythonObject".to_string())
+    }
+
+    fn repr(&self, _: &Vec<*const OnionObject>) -> Result<String, RuntimeError> {
+        // 使用 Python 的 __repr__ 方法
+        Python::with_gil(|py| match self.inner.call_method0(py, "__repr__") {
+            Ok(result) => result
+                .extract(py)
+                .map_err(|e| pyerr_to_runtime_error(e, py)),
+            Err(e) => Err(pyerr_to_runtime_error(e, py)),
+        })
+    }
+
+    fn to_string(&self, _: &Vec<*const OnionObject>) -> Result<String, RuntimeError> {
+        // 使用 Python 的 __str__ 方法
+        Python::with_gil(|py| match self.inner.call_method0(py, "__str__") {
+            Ok(result) => result
+                .extract(py)
+                .map_err(|e| pyerr_to_runtime_error(e, py)),
+            Err(e) => Err(pyerr_to_runtime_error(e, py)),
+        })
     }
 }
 
@@ -559,54 +662,112 @@ pub fn py_object_to_onion_object(py: Python<'_>, obj: Py<PyAny>) -> PyResult<Oni
         let onion_tuple_elements: Vec<OnionStaticObject> = elements.into_iter().collect();
         Ok(OnionTuple::new_static_no_ref(&onion_tuple_elements))
     } else {
-        Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
-            "Unsupported Python type for conversion to OnionObject: {:?}",
-            obj
-        )))
+        Ok(OnionObject::Custom(Arc::new(OnionPyObject { inner: obj.into() })).stabilize())
     }
 }
 
 /// An asynchronous Python function implemented in Rust.
 #[pyfunction]
 fn eval<'pya>(
-    // Changed to fn and added lifetime 'pya
-    py: Python<'pya>, // Added Python<'pya> parameter
+    py: Python<'pya>,
     code: String,
     work_dir: Option<String>,
+    context: Option<PyObject>,
 ) -> PyResult<Bound<'pya, PyAny>> {
-    // Changed return type to PyResult<Bound<'pya, PyAny>>
-    // Use future_into_py to bridge Rust Future to Python awaitable
+    // Extract context to a serializable form before entering async block
+    let context_serialized = if let Some(ctx) = context {
+        // Extract the context list in the current thread (with GIL)
+        let ctx_list: Vec<PyOnionObject> = ctx.extract(py)?;
+        let context_variables: Vec<OnionStaticObject> =
+            ctx_list.into_iter().map(|obj| obj.inner).collect();
+        Some(context_variables)
+    } else {
+        None
+    };
+
     future_into_py(py, async move {
         let work_dir_pathbuf = work_dir.map(|path| std::path::PathBuf::from(path));
         let mut dir_stack = match DirectoryStack::new(work_dir_pathbuf.as_deref()) {
             Ok(stack) => stack,
             Err(err) => {
-                // Convert Rust error to Python error
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                     "Failed to create directory stack: {}",
                     err
                 )));
             }
         };
-        // Execute the code and await the result within the async block
-        let result = match script::eval(&code, &mut dir_stack, None).await {
+        let context_variables_ref: Option<Vec<&OnionStaticObject>> =
+            context_serialized.as_ref().map(|v| v.iter().collect());
+        let result = match script::eval(&code, &mut dir_stack, context_variables_ref).await {
             Ok(value) => value,
             Err(err) => {
-                // Convert Rust error to Python error
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                     "Failed to evaluate script: {}",
                     err
                 )));
             }
         };
-        // Only acquire the GIL after all .await points
-        // Convert OnionStaticObject result to a Python object
-        Python::with_gil(|py| onion_object_to_py(py, result.weak()))
+        Python::with_gil(|py| PyOnionObject::from_rust(result).into_py_any(py))
     })
 }
-#[pymodule(name = "onion_py")]
+
+#[pyfunction]
+fn wrap_py_function<'py>(
+    params: PyObject,
+    signature: String,
+    function: PyObject,
+    capture: Option<PyObject>,
+    self_object: Option<PyObject>,
+    py: Python<'py>,
+) -> PyResult<PyOnionObject> {
+    // Wrap the Python function into an OnionLambdaDefinition
+    let params_onion = py_object_to_onion_object(py, params)?;
+    let capture_onion = capture
+        .map(|c| py_object_to_onion_object(py, c))
+        .transpose()?;
+    let self_object_onion = self_object
+        .map(|s| py_object_to_onion_object(py, s))
+        .transpose()?;
+    Ok(PyOnionObject::from_rust(pycallable::wrap_py_function(
+        &params_onion,
+        capture_onion.as_ref(),
+        self_object_onion.as_ref(),
+        signature,
+        function,
+    )))
+}
+
+#[pyfunction]
+fn wrap_py_coroutine<'py>(
+    params: PyObject,
+    signature: String,
+    coroutine: PyObject,
+    capture: Option<PyObject>,
+    self_object: Option<PyObject>,
+    py: Python<'py>,
+) -> PyResult<PyOnionObject> {
+    // Wrap the Python coroutine into a PythonCoroutineGenerator
+    let params_onion = py_object_to_onion_object(py, params)?;
+    let capture_onion = capture
+        .map(|c| py_object_to_onion_object(py, c))
+        .transpose()?;
+    let self_object_onion = self_object
+        .map(|s| py_object_to_onion_object(py, s))
+        .transpose()?;
+    Ok(PyOnionObject::from_rust(pycallable::wrap_py_coroutine(
+        &params_onion,
+        capture_onion.as_ref(),
+        self_object_onion.as_ref(),
+        signature,
+        coroutine,
+    )))
+}
+
+#[pymodule(name = "onion")]
 fn onion_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(eval, m)?)?;
+    m.add_function(wrap_pyfunction!(wrap_py_function, m)?)?;
+    m.add_function(wrap_pyfunction!(wrap_py_coroutine, m)?)?;
     m.add_class::<PyOnionObject>()?; // 注册新的 Python 类
     Ok(())
 }
