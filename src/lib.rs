@@ -613,7 +613,6 @@ pub fn onion_object_to_py(py: Python<'_>, obj: &OnionObject) -> PyResult<PyObjec
 }
 
 // Helper function to convert Python objects to OnionObject basic types
-// 修改此函数以处理 PyOnionObject 输入
 pub fn py_object_to_onion_object(py: Python<'_>, obj: Py<PyAny>) -> PyResult<OnionStaticObject> {
     // 检查输入是否是 PyOnionObject 的实例
     if let Ok(py_onion) = obj.extract::<PyRef<PyOnionObject>>(py) {
@@ -625,12 +624,13 @@ pub fn py_object_to_onion_object(py: Python<'_>, obj: Py<PyAny>) -> PyResult<Oni
         Ok(OnionObject::Float(f).stabilize())
     } else if let Ok(s) = obj.extract::<String>(py) {
         Ok(OnionObject::String(Arc::new(s)).stabilize())
-    } else if let Ok(b) = obj.extract::<Vec<u8>>(py) {
-        Ok(OnionObject::Bytes(Arc::new(b)).stabilize())
     } else if let Ok(b) = obj.extract::<bool>(py) {
         Ok(OnionObject::Boolean(b).stabilize())
     } else if obj.is_none(py) {
         Ok(OnionObject::Null.stabilize())
+    } else if let Ok(bytes) = obj.downcast_bound::<pyo3::types::PyBytes>(py) {
+        // Explicitly handle Python bytes objects
+        Ok(OnionObject::Bytes(Arc::new(bytes.as_bytes().to_vec())).stabilize())
     } else if let Ok(tuple) = obj.downcast_bound::<pyo3::types::PyTuple>(py) {
         // Convert Python tuple to OnionObject::Tuple
         let mut elements = Vec::new();
